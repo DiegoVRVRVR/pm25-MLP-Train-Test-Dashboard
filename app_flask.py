@@ -17,8 +17,10 @@ import itertools
 import time
 import json
 import os
-import warnings
 import traceback
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import warnings
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
@@ -56,8 +58,17 @@ def get_firebase_token():
 
 # ==================== FUNCIONES DEL MODELO ====================
 
-def load_and_combine_data(file_paths):
-    """Carga y combina archivos CSV - MANTIENE SIEMPRE LAS 3 VARIABLES"""
+def load_and_combine_data(file_paths, max_gap=3):
+    """
+    Carga y combina archivos CSV con interpolación limitada.
+    
+    Args:
+        file_paths: Dict con rutas de archivos {'pm1': path, 'pm25': path, 'pm10': path}
+        max_gap: Máximo de días consecutivos a interpolar (default: 3)
+    
+    Returns:
+        DataFrame con datos diarios, elimina filas con NaN después de interpolar
+    """
     try:
         dfs = []
         files_data = [
@@ -67,6 +78,7 @@ def load_and_combine_data(file_paths):
         ]
         
         print(f"[DEBUG] Iniciando carga de archivos CSV...")
+        print(f"[CONFIG] Max gap para interpolación: {max_gap} días")
         
         for file_path, col_name in files_data:
             if file_path and os.path.exists(file_path):
@@ -81,7 +93,7 @@ def load_and_combine_data(file_paths):
                     df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
                     df = df[df.index.notna()]
                     
-                    print(f"[DEBUG] {col_name} - NaN: {df[col_name].isna().sum()}/{len(df)}")
+                    print(f"[DEBUG] {col_name} - NaN antes de procesar: {df[col_name].isna().sum()}/{len(df)}")
                     dfs.append(df)
                     
                 except Exception as e:
@@ -89,6 +101,7 @@ def load_and_combine_data(file_paths):
                     continue
         
         if len(dfs) == 0:
+            print(f"[ERROR] No se pudo cargar ningún archivo")
             return None
         
         combined_df = pd.concat(dfs, axis=1, join='outer')
@@ -97,26 +110,45 @@ def load_and_combine_data(file_paths):
         daily_df = combined_df.resample('D').mean()
         print(f"[DEBUG] Después resample - Shape: {daily_df.shape}")
         
-        # RELLENAR NaN INTELIGENTEMENTE - MANTENER SIEMPRE LAS 3 COLUMNAS
+        # Registrar NaN antes de interpolar
+        nan_before = daily_df.isna().sum()
+        print(f"[DEBUG] NaN antes de interpolación:")
         for col in daily_df.columns:
-            nan_before = daily_df[col].isna().sum()
-            
-            daily_df[col] = daily_df[col].interpolate(method='linear', limit_direction='both')
-            daily_df[col] = daily_df[col].fillna(method='ffill', limit=7)
-            daily_df[col] = daily_df[col].fillna(method='bfill', limit=7)
-            
-            if daily_df[col].isna().any():
-                daily_df[col] = daily_df[col].fillna(daily_df[col].mean())
-            
-            if daily_df[col].isna().any():
-                daily_df[col] = daily_df[col].fillna(daily_df.mean(axis=1))
-            
-            daily_df[col] = daily_df[col].fillna(0)
-            
-            nan_after = daily_df[col].isna().sum()
-            print(f"[DEBUG] {col} - NaN rellenados: {nan_before} → {nan_after}")
+            print(f"  - {col}: {nan_before[col]}")
         
-        print(f"[DEBUG] Final - Shape: {daily_df.shape}, NaN total: {daily_df.isna().sum().sum()}")
+        # INTERPOLACIÓN CON LÍMITES ESTRICTOS
+        for col in daily_df.columns:
+            # Interpolar solo gaps de máximo 'max_gap' días consecutivos
+            daily_df[col] = daily_df[col].interpolate(
+                method='linear', 
+                limit=max_gap,  # Máximo de días consecutivos a interpolar
+                limit_direction='both'  # Bidireccional (forward y backward)
+            )
+        
+        # Registrar NaN después de interpolar
+        nan_after = daily_df.isna().sum()
+        print(f"[DEBUG] NaN después de interpolación:")
+        for col in daily_df.columns:
+            interpolated = nan_before[col] - nan_after[col]
+            print(f"  - {col}: {nan_after[col]} (interpolados: {interpolated})")
+        
+        # Filas antes de eliminar
+        rows_before_drop = len(daily_df)
+        
+        # ELIMINAR FILAS CON NaN RESTANTES
+        daily_df = daily_df.dropna()
+        
+        rows_after_drop = len(daily_df)
+        rows_dropped = rows_before_drop - rows_after_drop
+        
+        print(f"[INFO] ✂️ Filas eliminadas: {rows_dropped} ({rows_dropped/rows_before_drop*100:.1f}%)")
+        print(f"[INFO] ✅ Filas finales: {rows_after_drop}")
+        print(f"[DEBUG] Shape final: {daily_df.shape}, NaN total: {daily_df.isna().sum().sum()}")
+        
+        # Validación final
+        if len(daily_df) < 50:
+            print(f"[WARNING] ⚠️ Solo {len(daily_df)} días disponibles (mínimo recomendado: 50)")
+        
         return daily_df
     
     except Exception as e:
@@ -191,64 +223,273 @@ def preprocess_data(features_df):
         traceback.print_exc()
         return None
 
+def determine_architecture_pca_kmeans(X_train_scaled, y_train, classification_type='multiclass'):
+    """
+    Determina arquitectura de red neuronal usando PCA + K-Means
+    según el paper: "A Novel Approach in Determining Neural Networks Architecture"
+    
+    Args:
+        X_train_scaled: Datos de entrenamiento normalizados
+        y_train: Variable objetivo
+        classification_type: 'multiclass' (60-70% varianza) o 'binary' (40% varianza)
+    
+    Returns:
+        dict con arquitectura recomendada
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"🔬 MÉTODO PCA + K-MEANS PARA ARQUITECTURA")
+        print(f"{'='*60}")
+        
+        # PASO 1: Aplicar PCA
+        print(f"\n📊 PASO 1: Análisis de Componentes Principales (PCA)")
+        pca = PCA()
+        pca.fit(X_train_scaled)
+        
+        explained_variance = pca.explained_variance_ratio_
+        cumulative_variance = np.cumsum(explained_variance)
+        
+        print(f"   Total de componentes: {len(explained_variance)}")
+        print(f"   Varianza del 1er componente: {explained_variance[0]*100:.2f}%")
+        
+        # PASO 2: Determinar número de capas según varianza acumulada
+        print(f"\n🎯 PASO 2: Determinación del Número de Capas Ocultas")
+        
+        # Umbral según tipo de clasificación (paper)
+        if classification_type == 'multiclass':
+            target_variance = 0.65  # 60-70% según paper
+            print(f"   Tipo: Clasificación Multiclase")
+            print(f"   Umbral de varianza objetivo: 60-70%")
+        else:  # binary o regression
+            target_variance = 0.40  # 40% según paper
+            print(f"   Tipo: Clasificación Binaria/Regresión")
+            print(f"   Umbral de varianza objetivo: ~40%")
+        
+        # Encontrar número de componentes necesarios
+        n_components = np.argmax(cumulative_variance >= target_variance) + 1
+        n_components = max(1, min(n_components, 4))  # Limitar entre 1-4 capas
+        
+        print(f"   ✅ Varianza acumulada alcanzada: {cumulative_variance[n_components-1]*100:.2f}%")
+        print(f"   ✅ Número de capas ocultas recomendadas: {n_components}")
+        
+        # PASO 3: Clustering K-Means para cada componente
+        print(f"\n🔍 PASO 3: K-Means Clustering para Determinar Neuronas")
+        
+        # Transformar datos a componentes principales
+        X_pca = pca.transform(X_train_scaled)
+        
+        architecture = []
+        
+        for i in range(n_components):
+            print(f"\n   --- Componente {i+1} (Varianza: {explained_variance[i]*100:.2f}%) ---")
+            
+            # Datos del componente actual (reshape para K-Means)
+            component_data = X_pca[:, i].reshape(-1, 1)
+            
+            # Aplicar método del codo modificado (paper)
+            wss_values = []
+            k_range = range(2, min(51, len(component_data)))  # 2 a 50 clusters
+            
+            for k in k_range:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                kmeans.fit(component_data)
+                wss_values.append(kmeans.inertia_)
+            
+            # Criterio del codo modificado: 3 valores sucesivos sin cambio significativo
+            optimal_k = 2
+            for j in range(len(wss_values) - 3):
+                wss_window = wss_values[j:j+4]
+                # Calcular cambio porcentual entre valores consecutivos
+                changes = [abs((wss_window[idx+1] - wss_window[idx]) / wss_window[idx]) 
+                          for idx in range(3)]
+                
+                # Si los 3 cambios son menores al 5%, consideramos óptimo
+                if all(change < 0.05 for change in changes):
+                    optimal_k = k_range[j]
+                    break
+            
+            # Limitar neuronas a un rango razonable
+            optimal_k = max(4, min(optimal_k, 32))  # Entre 4 y 32 neuronas
+            
+            print(f"      Clusters óptimos (Método del Codo): {optimal_k}")
+            print(f"      ➜ Neuronas en capa {i+1}: {optimal_k}")
+            
+            architecture.append(optimal_k)
+        
+        # Ordenar arquitectura: mayor varianza = más cerca de la salida
+        # Paper: componentes con mayor varianza → capas más cercanas a salida
+        architecture.reverse()
+        
+        print(f"\n{'='*60}")
+        print(f"✨ ARQUITECTURA FINAL RECOMENDADA")
+        print(f"{'='*60}")
+        print(f"   Número de capas ocultas: {len(architecture)}")
+        for idx, neurons in enumerate(architecture, 1):
+            print(f"   Capa {idx}: {neurons} neuronas")
+        print(f"{'='*60}\n")
+        
+        return {
+            'method': 'PCA_KMEANS',
+            'layers': architecture,
+            'n_components': n_components,
+            'explained_variance': float(cumulative_variance[n_components-1]),
+            'target_variance': target_variance,
+            'pca_variances': explained_variance[:n_components].tolist()
+        }
+    
+    except Exception as e:
+        print(f"[ERROR] determine_architecture_pca_kmeans: {str(e)}")
+        traceback.print_exc()
+        # Fallback a arquitectura simple
+        return {
+            'method': 'PCA_KMEANS_FALLBACK',
+            'layers': [16],
+            'error': str(e)
+        }
 
-def tune_mlp_architecture(X_train_scaled, y_train, X_test_scaled, y_test, max_time_minutes=10):
-    """Búsqueda automática de arquitectura"""
+def tune_mlp_architecture(X_train_scaled, y_train, X_test_scaled, y_test, 
+                         max_time_minutes=10, method='pca_kmeans'):
+    """
+    Búsqueda automática de arquitectura con múltiples métodos
+    
+    Args:
+        method: 'pca_kmeans' (paper), 'grid_search' (original), o 'hybrid'
+    """
     try:
         start_time = time.time()
-        hidden_layers = [1, 2, 3]
-        neurons_options = [4, 8, 16, 32]
         
-        results = []
-        best_config = None
-        best_score = float('inf')
+        # ===== MÉTODO 1: PCA + K-MEANS (PAPER) =====
+        if method == 'pca_kmeans' or method == 'hybrid':
+            print(f"\n🎓 Método: PCA + K-Means (Paper)")
+            
+            # Determinar tipo de problema (simplificado: regresión continua)
+            classification_type = 'binary'  # Para PM2.5 (regresión continua)
+            
+            pca_result = determine_architecture_pca_kmeans(
+                X_train_scaled, y_train, 
+                classification_type=classification_type
+            )
+            
+            # Construir y evaluar modelo con arquitectura PCA+KMeans
+            layers = []
+            for i, n_neurons in enumerate(pca_result['layers']):
+                if i == 0:
+                    layers.append(tf.keras.layers.Dense(
+                        n_neurons, activation='relu',
+                        input_shape=(X_train_scaled.shape[1],)
+                    ))
+                else:
+                    layers.append(tf.keras.layers.Dense(n_neurons, activation='relu'))
+            layers.append(tf.keras.layers.Dense(1, activation='linear'))
+            
+            model = tf.keras.Sequential(layers)
+            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+            
+            history = model.fit(
+                X_train_scaled, y_train,
+                epochs=100,  # Más epochs para mejor evaluación
+                batch_size=32,
+                validation_data=(X_test_scaled, y_test),
+                verbose=0
+            )
+            
+            val_mse = history.history['val_loss'][-1]
+            val_mae = history.history['val_mae'][-1]
+            n_params = model.count_params()
+            
+            pca_config = {
+                'method': 'PCA_KMEANS',
+                'layers': pca_result['layers'],
+                'val_mse': val_mse,
+                'val_mae': val_mae,
+                'params': n_params,
+                'score': val_mse + 0.001 * n_params,
+                'explained_variance': pca_result['explained_variance'],
+                'n_components': pca_result['n_components']
+            }
+            
+            print(f"\n📊 Resultado PCA+KMeans:")
+            print(f"   Arquitectura: {pca_config['layers']}")
+            print(f"   MSE Validación: {val_mse:.4f}")
+            print(f"   MAE Validación: {val_mae:.4f}")
+            print(f"   Parámetros: {n_params}")
+            
+            if method == 'pca_kmeans':
+                return pca_config, [pca_config]
         
-        for n_layers in hidden_layers:
-            for neurons_combo in itertools.combinations_with_replacement(neurons_options, n_layers):
-                if (time.time() - start_time) > (max_time_minutes * 60):
-                    break
-                
-                layers = []
-                for i, n_neurons in enumerate(neurons_combo):
-                    if i == 0:
-                        layers.append(tf.keras.layers.Dense(
-                            n_neurons, activation='relu',
-                            input_shape=(X_train_scaled.shape[1],)
-                        ))
-                    else:
-                        layers.append(tf.keras.layers.Dense(n_neurons, activation='relu'))
-                layers.append(tf.keras.layers.Dense(1, activation='linear'))
-                
-                model = tf.keras.Sequential(layers)
-                model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-                
-                history = model.fit(
-                    X_train_scaled, y_train,
-                    epochs=50, batch_size=32,
-                    validation_data=(X_test_scaled, y_test),
-                    verbose=0
-                )
-                
-                val_mse = history.history['val_loss'][-1]
-                val_mae = history.history['val_mae'][-1]
-                n_params = model.count_params()
-                
-                config = {
-                    'layers': list(neurons_combo),
-                    'val_mse': val_mse,
-                    'val_mae': val_mae,
-                    'params': n_params,
-                    'score': val_mse + 0.001 * n_params
-                }
-                results.append(config)
-                
-                if config['score'] < best_score:
-                    best_score = config['score']
-                    best_config = config
+        # ===== MÉTODO 2: GRID SEARCH (ORIGINAL) =====
+        if method == 'grid_search' or method == 'hybrid':
+            print(f"\n🔍 Método: Grid Search (Original)")
+            
+            hidden_layers = [1, 2, 3]
+            neurons_options = [4, 8, 16, 32]
+            
+            results = []
+            best_config = None
+            best_score = float('inf')
+            
+            for n_layers in hidden_layers:
+                for neurons_combo in itertools.combinations_with_replacement(neurons_options, n_layers):
+                    if (time.time() - start_time) > (max_time_minutes * 60):
+                        break
+                    
+                    layers = []
+                    for i, n_neurons in enumerate(neurons_combo):
+                        if i == 0:
+                            layers.append(tf.keras.layers.Dense(
+                                n_neurons, activation='relu',
+                                input_shape=(X_train_scaled.shape[1],)
+                            ))
+                        else:
+                            layers.append(tf.keras.layers.Dense(n_neurons, activation='relu'))
+                    layers.append(tf.keras.layers.Dense(1, activation='linear'))
+                    
+                    model = tf.keras.Sequential(layers)
+                    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+                    
+                    history = model.fit(
+                        X_train_scaled, y_train,
+                        epochs=50, batch_size=32,
+                        validation_data=(X_test_scaled, y_test),
+                        verbose=0
+                    )
+                    
+                    val_mse = history.history['val_loss'][-1]
+                    val_mae = history.history['val_mae'][-1]
+                    n_params = model.count_params()
+                    
+                    config = {
+                        'method': 'GRID_SEARCH',
+                        'layers': list(neurons_combo),
+                        'val_mse': val_mse,
+                        'val_mae': val_mae,
+                        'params': n_params,
+                        'score': val_mse + 0.001 * n_params
+                    }
+                    results.append(config)
+                    
+                    if config['score'] < best_score:
+                        best_score = config['score']
+                        best_config = config
+            
+            results.sort(key=lambda x: x['score'])
+            
+            if method == 'grid_search':
+                return best_config, results[:5]
         
-        results.sort(key=lambda x: x['score'])
-        return best_config, results[:5]
-    
+        # ===== MÉTODO 3: HYBRID (COMPARAR AMBOS) =====
+        if method == 'hybrid':
+            print(f"\n⚖️  Comparación Final:")
+            print(f"   PCA+KMeans Score: {pca_config['score']:.4f}")
+            print(f"   Grid Search Score: {best_config['score']:.4f}")
+            
+            if pca_config['score'] < best_config['score']:
+                print(f"   ✅ Ganador: PCA+KMeans (mejor score)")
+                return pca_config, [pca_config] + results[:4]
+            else:
+                print(f"   ✅ Ganador: Grid Search (mejor score)")
+                return best_config, [best_config, pca_config] + results[:3]
+        
     except Exception as e:
         print(f"[ERROR] tune_mlp_architecture: {str(e)}")
         traceback.print_exc()
@@ -332,9 +573,14 @@ def train_model(file_paths, config, mode='auto'):
         
         if mode == 'auto':
             print(f"[DEBUG] Auto-tuning...")
+            
+            # Determinar método de tuning
+            tuning_method = config.get('tuning_method', 'pca_kmeans')  # 'pca_kmeans', 'grid_search', 'hybrid'
+            
             best_config, top_configs = tune_mlp_architecture(
                 X_train_scaled, y_train.values, X_test_scaled, y_test.values,
-                max_time_minutes=config.get('tuning_time', 5)
+                max_time_minutes=config.get('tuning_time', 5),
+                method=tuning_method  # ✅ NUEVO: Pasar método seleccionado
             )
             if best_config is None:
                 return {'error': 'Error en auto-tuning'}
@@ -425,7 +671,8 @@ def upload_to_firebase(model_path, scaler_mean, scaler_scale, max_lag, model_con
                 'optimizer': model_config.get('optimizer', 'adam'),
                 'loss_function': model_config.get('loss_function', 'mse'),
                 'total_params': model_config.get('total_params', 0),
-                'training_mode': model_config.get('mode', 'auto')
+                'training_mode': model_config.get('mode', 'auto'),
+                 'tuning_method': model_config.get('tuning_method', 'auto')
             }
         }
         
@@ -456,6 +703,33 @@ def upload_to_firebase(model_path, scaler_mean, scaler_scale, max_lag, model_con
         return {'success': False, 'error': str(e)}
 
 # ==================== RUTAS FLASK ====================
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring and load balancers"""
+    try:
+        import tensorflow as tf
+        import pandas as pd
+        import numpy as np
+        
+        health_status = {
+            'status': 'healthy',
+            'version': '1.0.0',
+            'timestamp': datetime.datetime.now().isoformat(),
+            'dependencies': {
+                'flask': True,
+                'tensorflow': True,
+                'pandas': True,
+                'numpy': True
+            }
+        }
+        return jsonify(health_status), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -538,7 +812,7 @@ def train():
         
         model = result['model']
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        #converter.optimizations = [tf.lite.Optimize.DEFAULT]
         tflite_model = converter.convert()
         
         with open('model_mlp.tflite', 'wb') as f:
@@ -555,6 +829,17 @@ def train():
                 'activation': layer_config.get('activation', 'relu')
             })
         
+        # ✅ NUEVO: Extraer información del método de tuning usado
+        tuning_info = result.get('tuning_info', {})
+        tuning_method = config.get('tuning_method', 'auto')
+        
+        # ✅ NUEVO: Agregar metadata PCA si se usó ese método
+        if tuning_info.get('method') == 'PCA_KMEANS':
+            print(f"[INFO] Modelo entrenado con PCA+K-Means:")
+            print(f"  - Varianza explicada: {tuning_info.get('explained_variance', 0)*100:.2f}%")
+            print(f"  - Componentes PCA: {tuning_info.get('n_components', 0)}")
+            print(f"  - Arquitectura: {[layer['neurons'] for layer in architecture]}")
+        
         response = {
             'success': True,
             'metrics': result['metrics'],
@@ -565,7 +850,8 @@ def train():
                 'scale': model._scaler.scale_.tolist()
             },
             'max_lag': config.get('max_lag', 5),
-            # NUEVA INFO DE CONFIGURACIÓN
+            'tuning_method': tuning_method,  # ✅ NUEVO: Preservar método usado
+            # INFO DE CONFIGURACIÓN
             'model_config': {
                 'architecture': architecture,
                 'epochs': config.get('epochs', 200),
@@ -574,7 +860,10 @@ def train():
                 'optimizer': 'adam',
                 'loss_function': 'mse',
                 'total_params': result['metrics']['n_params'],
-                'mode': config.get('mode', 'auto')
+                'mode': config.get('mode', 'auto'),
+                'tuning_method': tuning_method,  # ✅ NUEVO: También aquí para Firebase
+                # ✅ NUEVO: Metadata adicional si se usó PCA+K-Means
+                'tuning_info': tuning_info if tuning_info else None
             }
         }
         
@@ -654,6 +943,14 @@ def backtest():
         y_test = np.array(result['predictions']['y_test'])
         y_pred = np.array(result['predictions']['y_pred'])
         dates = result['predictions']['dates']
+        
+        # LIMITAR A LOS DÍAS ESPECIFICADOS POR EL USUARIO
+        test_days = config.get('test_days', 7)
+        if len(y_test) > test_days:
+            print(f"[DEBUG] Limitando resultados de {len(y_test)} a {test_days} días")
+            y_test = y_test[-test_days:]
+            y_pred = y_pred[-test_days:]
+            dates = dates[-test_days:]
 
         # Calcular métricas detalladas
         mae = float(mean_absolute_error(y_test, y_pred))

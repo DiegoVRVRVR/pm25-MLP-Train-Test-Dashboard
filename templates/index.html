@@ -98,6 +98,23 @@
           </label>
         </div>
 
+        <div id="auto-tuning-method" class="select-group" style="margin-top: var(--spacing-md);">
+          <label>
+            <span style="color: var(--text-accent);">🎓 Método de Auto-Tuning:</span>
+          </label>
+          <select id="tuning-method" style="margin-top: 0.5rem;">
+            <option value="pca_kmeans">PCA + K-Means (Paper - Recomendado)</option>
+            <option value="grid_search">Grid Search (Búsqueda Exhaustiva)</option>
+            <option value="hybrid">Híbrido (Comparar Ambos)</option>
+          </select>
+          <div style="margin-top: 0.5rem; padding: 0.75rem; background: rgba(88, 166, 255, 0.1); border-left: 3px solid var(--color-accent); border-radius: 4px;">
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0; line-height: 1.4;">
+              <strong id="method-description">PCA + K-Means:</strong>
+              <span id="method-details">Determina capas con análisis de componentes principales y neuronas con clustering. Basado en investigación científica.</span>
+            </p>
+          </div>
+        </div>
+        
         <!-- Configuración Auto -->
         <div id="auto-config">
           <div class="slider-group">

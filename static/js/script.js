@@ -76,10 +76,53 @@ function initializeModeToggle() {
       document.getElementById('auto-config').classList.toggle('hidden', isManual);
       document.getElementById('manual-layers').classList.toggle('hidden', !isManual);
       
+      // ✅ NUEVO: Mostrar/ocultar selector de método
+      const tuningMethodDiv = document.getElementById('auto-tuning-method');
+      if (tuningMethodDiv) {
+        tuningMethodDiv.classList.toggle('hidden', isManual);
+      }
+      
       if (isManual) {
         updateLayersUI();
       }
     });
+  });
+  
+  // ✅ NUEVO: Inicializar selector de método de tuning
+  initializeTuningMethodSelector();
+}
+
+// ✅ NUEVA FUNCIÓN: Manejar cambios en el selector de método
+function initializeTuningMethodSelector() {
+  const tuningMethodSelect = document.getElementById('tuning-method');
+  const methodDescription = document.getElementById('method-description');
+  const methodDetails = document.getElementById('method-details');
+  
+  if (!tuningMethodSelect || !methodDescription || !methodDetails) return;
+  
+  const methodInfo = {
+    'pca_kmeans': {
+      title: 'PCA + K-Means:',
+      description: 'Determina capas con análisis de componentes principales y neuronas con clustering. Basado en investigación científica publicada.'
+    },
+    'grid_search': {
+      title: 'Grid Search:',
+      description: 'Prueba múltiples combinaciones de arquitecturas y selecciona la mejor. Más lento pero exhaustivo.'
+    },
+    'hybrid': {
+      title: 'Híbrido:',
+      description: 'Compara ambos métodos (PCA+K-Means vs Grid Search) y selecciona el de mejor rendimiento. Tiempo de ejecución duplicado.'
+    }
+  };
+  
+  tuningMethodSelect.addEventListener('change', (e) => {
+    const method = e.target.value;
+    const info = methodInfo[method];
+    
+    if (info) {
+      methodDescription.textContent = info.title;
+      methodDetails.textContent = info.description;
+    }
   });
 }
 
@@ -233,6 +276,12 @@ async function handleTrain() {
   // Configuración específica según modo
   if (mode === 'auto') {
     config.tuning_time = parseInt(document.getElementById('tuning-time').value);
+    const tuningMethodSelect = document.getElementById('tuning-method');
+    if (tuningMethodSelect) {
+      config.tuning_method = tuningMethodSelect.value;
+    } else {
+      config.tuning_method = 'pca_kmeans';  // Default si no existe el selector
+    }
   } else {
     const numLayers = parseInt(document.getElementById('num-layers').value);
     config.layers = [];
@@ -267,6 +316,7 @@ async function handleTrain() {
     
     if (data.success) {
       modelData = data;
+      modelData.tuning_method = config.tuning_method || 'auto';
       displayTrainingResults(data);
       displayPredictionResults(data);
       enableDeployment(data);
@@ -636,7 +686,11 @@ async function handleFirebaseUpload() {
   const btn = document.getElementById('btn-firebase');
   btn.disabled = true;
   btn.innerHTML = '<span class="btn-icon">⏳</span> Subiendo...';
-  
+  const modelConfigWithMethod = {
+    ...modelData.model_config,
+    tuning_method: modelData.tuning_method || 'auto'  // Preservar método usado
+  };
+
   try {
     const response = await fetch('/deploy', {
       method: 'POST',
@@ -645,7 +699,7 @@ async function handleFirebaseUpload() {
         scaler_mean: modelData.scaler.mean,
         scaler_scale: modelData.scaler.scale,
         max_lag: modelData.max_lag,
-        model_config: modelData.model_config  // AÑADIR CONFIGURACIÓN
+        model_config: modelConfigWithMethod  // ✅ ACTUALIZADO
       })
     });
     
@@ -677,6 +731,15 @@ async function handleFirebaseUpload() {
 function displayFirebaseDeployment(result) {
   const metadata = result.metadata;
   const architecture = metadata.architecture || [];
+  const tuningMethod = metadata.tuning_method || 'auto';
+  const methodNames = {
+    'pca_kmeans': '🎓 PCA + K-Means (Paper)',
+    'grid_search': '🔍 Grid Search (Exhaustivo)',
+    'hybrid': '⚖️ Híbrido (Comparativo)',
+    'auto': '⚡ Auto-Tuning (Genérico)'
+  };
+
+  const methodName = methodNames[tuningMethod] || '⚡ Auto-Tuning';
   
   // Generar tabla de capas
   const layersTable = architecture.map((layer, idx) => `
@@ -761,6 +824,15 @@ function displayFirebaseDeployment(result) {
             <span class="param-label">Modo de Entrenamiento:</span>
             <span class="param-value">${metadata.training_mode === 'auto' ? '⚡ Auto-Tuning' : '🎛️ Manual'}</span>
           </div>
+
+          <!-- ✅ NUEVO: Mostrar método de auto-tuning usado -->
+          ${metadata.training_mode === 'auto' ? `
+          <div class="param-item">
+            <span class="param-label">Método de Optimización:</span>
+            <span class="param-value">${methodName}</span>
+          </div>
+          ` : ''}
+
           <div class="param-item">
             <span class="param-label">Épocas:</span>
             <span class="param-value">${metadata.epochs}</span>
